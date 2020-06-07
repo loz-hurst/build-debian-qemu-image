@@ -1,0 +1,414 @@
+#!/bin/bash
+
+# Copyright 2020 Laurence Alexander Hurst
+#
+# This file is part of build-debian-qemu-image.
+#
+#    build-debian-qemu-image is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    build-debian-qemu-image is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with build-debian-qemu-image.  If not, see <https://www.gnu.org/licenses/>.
+#
+# See the file LICENCE in the original source code repository for the
+# full licence.
+
+if [[ $UID -ne 0 ]]
+then
+	echo "This script must be run as root." >&2
+	exit 1
+fi
+
+# These require command to get and are needed for the usage message,
+# which is why they are the only defaults pulled out as a variable
+# like this.
+DEFAULT_SUITE="$( grep -s -m1 '^deb ' /etc/apt/sources.list | awk '{print $3}' )"
+DEFAULT_DOMAIN="$( hostname -d )"
+# In MiB.  How large should swap be? First 271MiB is used for system (boot)
+# partitions and reserved space, so 753 takes us to the 1024MiB (1GiB)
+# position on the disk (1(reserved) + 270(efi) + 753(swap) = 1024MiB = 1GiB)
+DEFAULT_SWAP=753
+# An be in any format recognised by qemu-img - note sizes (K, M, G, T) are KiB not KB.
+DEFAULT_SIZE="5G"
+
+
+usage() {
+	cat - <<EOF
+Usage: $0 [-hSDM] [-s suite] [-f file] [-z size] [-r passwd] [name]
+
+-h:        Display this message and exit
+-S:        Skip debootstrap initialising a blank image and go stright to
+           mounting.  Requires an already setup image file as target.
+-D:        Do debootstrap only and exit without chrooting and doing the
+           stage 2 process.  As the debootstrap is the most time-consuming
+           element, this can be helpful combined with -S during debugging and
+           development.  The stage 2 script will still be written out.
+-M:        Leave the NBD attached and chroot filesystems mounted at the end.
+-s suite:  the Debian suite to build, defaults to $DEFAULT_SUITE (taken from
+           first line matching /^deb / in /etc/apt/sources.list).
+-f file:   filename for the image, defaults to <name>.qcow2
+-z size:   Size of the image, in a format understood by the qemu-img command.
+           Defaults to $DEFAULT_SIZE, first 1GiB is entirely consumed by boot and swap
+           partitions.
+-w size:   Size of the image's swap partition in MiB (set to 0 to disable),
+           defaults to ${DEFAULT_SWAP}
+-r var:    Use passwd in var environment variable as the encrypted root
+           password in the built image (avoids exposing the password via the
+           command-line, which any user on the system can see).
+-d domain: Use domain as the new hosts domain, defaults to $DEFAULT_DOMAIN (
+           taken from this host's 'hostname -d')
+name:      hostname to configure the image to, defaults to debian-<suite>
+EOF
+}
+
+while getopts ":hSDMs:f:z:r:d:" opt;
+do
+	case $opt in
+		h )
+			usage
+			exit 0
+			;;
+		\? )
+			usage
+			exit 0
+			;;
+		s )
+			SUITE="$OPTARG"
+			;;
+		f )
+			FILE="$OPTARG"
+			;;
+		z )
+			SIZE="$OPTARG"
+			;;
+		r )
+			ROOT_PASSWD="$( eval "echo \${$OPTARG}" )"
+			;;
+		d )
+			DOMAIN_NAME="$OPTARG"
+			;;
+		S )
+			SKIP_DEBOOTSTRAP="skip"
+			;;
+		D )
+			SKIP_STAGE2="skip"
+			;;
+		M )
+			SKIP_UNMOUNT="skip"
+			;;
+		: )
+			echo "Error: option $OPTARG missing an argument" >&2
+			exit 1
+			;;
+	esac
+done
+shift $((OPTIND - 1))
+
+NAME="$1"
+
+# Set defaults for anything not set
+[[ -z $SUITE ]] && SUITE="$DEFAULT_SUITE"
+[[ -z $NAME ]] && NAME="debian-$SUITE"
+[[ -z $FILE ]] && FILE="$NAME.qcow2"
+[[ -z $SIZE ]] && SIZE="$DEFAULT_SIZE"
+[[ -z $DOMAIN_NAME ]] && DOMAIN_NAME="$DEFAULT_DOMAIN"
+[[ -z $SWAP_SIZE ]] && SWAP_SIZE="$DEFAULT_SWAP"
+
+[[ -z $ROOT_PASSWD ]] && echo "No root password given.  None will be set in the image."
+
+# Other variables that might need to be changed or user-provided options in
+# the future
+NBD_DEV=/dev/nbd0 # NBD device for connecting image
+# In MiB, how large should be EFI system partition be. According to Arch's
+# wiki "the partition should be at least 260 MiB":
+# https://wiki.archlinux.org/index.php/EFI_system_partition
+EFI_SIZE=270
+
+echo "Will build image of size $SIZE, with hostname $NAME,"
+echo "  in $FILE from suite $SUITE"
+
+# From now on, abort on error
+set -e
+
+# Create image file, unless reusing an existing one
+if [[ -z "$SKIP_DEBOOTSTRAP" ]]
+then
+	echo "Creating image"
+	qemu-img create -f qcow2 $FILE $SIZE
+else
+	if ! [[ -f $FILE ]]
+	then
+		echo "Cannot skip debootstrap if the image does not exist." >&2
+		exit 1
+	fi
+fi
+
+echo "Checking for nbd support"
+if ! lsmod | grep -q '^nbd\s'
+then
+	echo "Probing module"
+	modprobe nbd
+fi
+
+
+if ! [[ -e $NBD_DEV ]]
+then
+	echo "Sanity check for $NBD_DEV failed. Aborting." >&2
+	exit 1
+fi
+
+echo "Mounting image on $NBD_DEV"
+qemu-nbd -c $NBD_DEV $FILE
+
+PARTED_COMMANDS="mklabel gpt \
+mkpart primary fat32 1MiB $(( 1 + EFI_SIZE ))MiB \
+name 1 uefi \
+set 1 esp on"
+if [[ $SWAP_SIZE == 0 ]]
+then
+	echo "Skipping swap"
+	NO_SWAP="no-swap"
+	ROOT_PART=2
+	ROOT_START="$(( 1 + EFI_SIZE ))MiB"
+else
+	echo "Partitoning with ${SWAP_SIZE}MiB for swap and rest for root"
+	PARTED_COMMANDS="$PARTED_COMMANDS \
+mkpart primary linux-swap $(( 1 + EFI_SIZE ))MiB $(( 1 + EFI_SIZE + SWAP_SIZE ))MiB \
+name 2 swap"
+	ROOT_PART=3
+	ROOT_START="$(( 1 + EFI_SIZE + SWAP_SIZE ))MiB"
+fi
+
+PARTED_COMMANDS="$PARTED_COMMANDS \
+mkpart primary ext4 $ROOT_START -0 \
+name $ROOT_PART root"
+unset ROOT_START
+
+# Only apply partitioning if not skipping debootstrap
+if [[ -z "$SKIP_DEBOOTSTRAP" ]]
+then
+	parted -s -a optimal -- $NBD_DEV \
+		$PARTED_COMMANDS
+	unset PARTED_COMMANDS
+fi
+
+echo "Partitioned disk:"
+parted -s $NBD_DEV print
+
+# Only format if not skipping debootstrap
+if [[ -z "$SKIP_DEBOOTSTRAP" ]]
+then
+	echo "Formating:"
+	echo "...EFI partition"
+	mkfs -t fat -F 32 -n EFI ${NBD_DEV}p1
+	if [[ -z $NO_SWAP ]]
+	then
+		echo "...swap"
+		mkswap -L swap ${NBD_DEV}p2
+	fi
+	echo "...root"
+	mkfs -t ext4 -L root ${NBD_DEV}p${ROOT_PART}
+fi
+unset ROOT_PART
+
+
+ROOT_UUID="$(blkid | grep "^${NBD_DEV}p[0-9]\+:" | grep ' LABEL="root" ' | grep -o ' UUID="[^"]\+"' | sed -e 's/^ //' )"
+[[ -z $NO_SWAP ]] && SWAP_UUID="$(blkid | grep "^${NBD_DEV}p[0-9]\+:" | grep ' LABEL="swap" ' | grep -o ' UUID="[^"]\+"' | sed -e 's/^ //' )"
+EFI_UUID="$(blkid | grep "^${NBD_DEV}p[0-9]\+:" | grep ' LABEL="EFI" ' | grep -o ' UUID="[^"]\+"' | sed -e 's/^ //' )"
+
+echo "Root: $ROOT_UUID"
+[[ -z $NO_SWAP ]] && echo "swap: $SWAP_UUID"
+echo "EFI: $EFI_UUID"
+
+echo "Mounting for chroot"
+mount $ROOT_UUID /mnt
+[[ -d /mnt/boot/efi ]] || mkdir -p /mnt/boot/efi
+mount $EFI_UUID /mnt/boot/efi
+
+# The main debootstrap - skip if requested
+if [[ -z "$SKIP_DEBOOTSTRAP" ]]
+then
+	echo "Bootstrapping debian"
+	# XXX Hardcoded to x86_64 architecture but at the moment I do not want to run anything else.
+	debootstrap --arch amd64 --include=salt-minion $SUITE /mnt http://ftp.uk.debian.org/debian
+fi
+
+echo "Mounting proc, dev and sys"
+mount -o bind,ro /dev /mnt/dev
+mount -t proc none /mnt/proc
+mount -t sysfs none /mnt/sys
+
+echo "Preparing stage 2"
+cat > /mnt/root/stage-2-setup.bash <<EOF
+#!/bin/bash
+
+set -e # Abort on error
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "Configuring fstab"
+cat > /etc/fstab <<S2EOF
+# /etc/fstab: static file system information.
+#
+# Use 'blkid' to print the universally unique identifier for a
+# device; this may be used with UUID= as a more robust way to name devices
+# that works even if disks are added and removed. See fstab(5).
+#
+# <file system> <mount point>   <type>  <options>       <dump>  <pass>
+$( [[ -z $NO_SWAP ]] && echo "$SWAP_UUID none swap sw  0       0" )
+$ROOT_UUID / ext4 errors=remount-ro 0 1
+$EFI_UUID /boot/efi vfat defaults 0 1
+S2EOF
+cat /etc/fstab
+
+echo "...mounting"
+[[ -d /boot/efi ]] || mkdir /boot/efi
+mount -a
+
+echo "--------------------------------------------"
+
+echo "Setting timezone"
+debconf-set-selections <<S2EOF
+tzdata tzdata/Areas select Europe
+tzdata tzdata/Zones/Europe select London
+S2EOF
+# This is necessary as tzdata will assume these are manually set and override the debconf values with their settings
+rm -f /etc/localtime /etc/timezone
+dpkg-reconfigure -f noninteractive tzdata
+
+echo "--------------------------------------------"
+
+echo "Configuring networking"
+echo "...lo"
+cat - >>/etc/network/interaces <<S2EOF
+
+auto lo
+iface lo inet loopback
+S2EOF
+
+echo "...enp1s0"
+cat - >/etc/network/interfaces.d/enp1s0 <<S2EOF
+allow-hotplug enp1s0
+iface enp1s0 inet dhcp
+S2EOF
+
+echo "Configuring hostname"
+echo "$NAME" > /etc/hostname
+
+echo "Setting up /etc/hosts"
+cat - >/etc/hosts <<S2EOF
+127.0.0.1       localhost
+127.0.1.1       $NAME.$DOMAIN_NAME $NAME
+
+# The following lines are desirable for IPv6 capable hosts
+::1     localhost ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+S2EOF
+
+echo "--------------------------------------------"
+
+echo "Configuring apt sources"
+
+cat - >/etc/apt/sources.list <<S2EOF
+deb http://ftp.uk.debian.org/debian/ buster main
+deb-src http://ftp.uk.debian.org/debian/ buster main
+
+deb http://security.debian.org/debian-security buster/updates main
+deb-src http://security.debian.org/debian-security buster/updates main
+
+# buster-updates, previously known as 'volatile'
+deb http://ftp.uk.debian.org/debian/ buster-updates main
+deb-src http://ftp.uk.debian.org/debian/ buster-updates main
+S2EOF
+
+apt-get -qq -y update
+
+echo "--------------------------------------------"
+
+echo "Configuring locales and keyboard"
+debconf-set-selections <<S2EOF
+locales locales/locales_to_be_generated multiselect en_GB.UTF-8 UTF-8
+locales locales/default_environment_locale select en_GB.UTF-8
+keyboard-configuration keyboard-configuration/layoutcode string gb
+keyboard-configuration keyboard-configuration/variant select English (UK)
+keyboard-configuration keyboard-configuration/model select Generic 105-key PC (intl.)
+S2EOF
+# Stop anything overriding debconf's settings
+rm -f /etc/default/locale /etc/locale.gen /etc/default/keyboard
+apt-get -qq -y install locales console-setup
+
+echo "--------------------------------------------"
+
+echo "Installing kernel"
+apt-get -qq -y install linux-image-amd64
+
+echo "--------------------------------------------"
+
+echo "Installing bootloader"
+apt-get -qq -y install grub-efi-amd64
+# Add console=ttyS0 so we get early boot messages on the serial console.
+sed -i -e 's/^\\(GRUB_CMDLINE_LINUX="[^"]*\\)"$/\\1 console=ttyS0"/' /etc/default/grub
+cat - >>/etc/default/grub <<S2EOF
+GRUB_TERMINAL="serial"
+GRUB_SERIAL_COMMAND="serial --unit=0 --speed=9600 --stop=1"
+S2EOF
+grub-install --target=x86_64-efi
+update-grub
+
+echo "Copying fallback bootloader"
+mkdir /boot/efi/EFI/BOOT
+cp /boot/efi/EFI/debian/fbx64.efi /boot/efi/EFI/BOOT/bootx64.efi
+
+echo "--------------------------------------------"
+
+echo "Enabling serial console"
+systemctl enable serial-getty@ttyS0.service
+
+echo "--------------------------------------------"
+
+if [[ -n '$ROOT_PASSWD' ]]
+then
+	echo "Setting root password"
+	echo 'root:$ROOT_PASSWD' | chpasswd -e
+	echo "--------------------------------------------"
+fi
+
+echo "Tidying..."
+apt-get clean
+
+echo "=== STAGE 2 SUCCESSFULLY REACHED THE END ==="
+EOF
+
+# Only do stage 2 if not skipping it
+if [[ -z $SKIP_STAGE2 ]]
+then
+	echo "Running stage 2 script in chroot"
+	LANG=C.UTF-8 chroot /mnt /bin/bash /root/stage-2-setup.bash
+
+	echo "Removing stage 2 script"
+	rm /mnt/root/stage-2-setup.bash
+else
+	echo "Skipping stage 2, script has been writtn to /mnt/root/stage-2-setup.bash"
+fi
+
+if [[ -z $SKIP_UNMOUNT ]]
+then
+	echo "Unmounting chroot"
+	umount /mnt/dev /mnt/proc /mnt/sys /mnt/boot/efi /mnt
+
+	echo "Disconnecting $NBD_DEV"
+	sync
+	qemu-nbd -d $NBD_DEV
+else
+	echo "WARNING: Unmount skipped (as requested)" >&2
+	echo "Multiple filesystems are mounted at and under /mnt, do not forget to unmount when finished."
+	echo "NBD is also still connected, disconnect (AFTER unmounting!) with: qemu-nbd -d $NBD_DEV"
+fi
