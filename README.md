@@ -26,6 +26,14 @@ along with build-debian-qemu-image.  If not, see <https://www.gnu.org/licenses/>
 See the file LICENCE in the original source code repository for the
 full licence.
 
+## Prerequisites
+
+You will need:
+
+* [debootstrap](https://packages.debian.org/search?keywords=debootstrap&searchon=names&suite=stable&section=all)
+* [dosfstools](https://packages.debian.org/search?keywords=dosfstools&searchon=names&suite=stable&section=all)
+* [qemu-utils](https://packages.debian.org/search?keywords=qemu-utils&searchon=names&suite=stable&section=all)
+
 ## Usage
 
 ```
